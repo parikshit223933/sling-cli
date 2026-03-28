@@ -24,6 +24,8 @@ import (
 	"github.com/slingdata-io/sling-cli/core/env"
 	"github.com/slingdata-io/sling-cli/core/sling"
 
+	"sync"
+
 	"github.com/flarco/g"
 	"github.com/spf13/cast"
 )
@@ -591,49 +593,143 @@ func replicationRun(cfgPath string, cfgOverwrite *sling.Config, selectStreams ..
 	counter := 0
 	cleanedForChunkLoad := map[string]bool{}
 
-	for _, cfg := range replication.Tasks {
-		if interrupted {
-			break
+	// Read SLING_THREADS for parallel execution
+	threadCount := 1
+	if val := replication.Env["SLING_THREADS"]; val != nil {
+		threadCount = cast.ToInt(val)
+	}
+	if envVal := os.Getenv("SLING_THREADS"); envVal != "" {
+		threadCount = cast.ToInt(envVal)
+	}
+	if threadCount < 1 {
+		threadCount = 1
+	}
+
+	if threadCount > 1 && streamCnt > 1 {
+		// Parallel execution with SLING_THREADS goroutines
+		g.Info("Running with %d parallel threads", threadCount)
+
+		sem := make(chan struct{}, threadCount)
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+
+		// Track completed tasks for dependency resolution
+		completed := make(map[string]chan struct{})
+		for _, cfg := range replication.Tasks {
+			completed[cfg.StreamName] = make(chan struct{})
 		}
 
-		// if we're chunking and if truncate/full-refresh
-		// truncate or drop right now, the first task will re-create it
-		cleaned := cleanedForChunkLoad[cfg.Target.Object]
-		if !isThreadChild && !cleaned && (cfg.IsFullRefreshWithChunking() || cfg.IsTruncateWithChunking()) {
-			if err = cfg.ClearTableForChunkLoadWithRange(); err != nil {
-				return g.Error(err, "could not clear table in target conn for chunk loading")
+		for _, cfg := range replication.Tasks {
+			if interrupted {
+				break
 			}
-			cleanedForChunkLoad[cfg.Target.Object] = true
-		}
 
-		if sling.IsReplicationRunMode() {
-			env.LogSink = nil // clear log sink if replication mode
-		}
-
-		if cfg.ReplicationStream.Disabled {
-			println()
-			g.Debug("skipping stream %s since it is disabled", cfg.StreamName)
-			continue
-		} else if streamCnt == 1 {
-			g.Info("Sling Replication | %s -> %s | %s", replication.Source, replication.Target, env.BlueString(cfg.StreamName))
-		} else {
-			println()
-			counter++
-			g.Info("[%d / %d] running stream %s", counter, streamCnt, env.BlueString(cfg.StreamName))
-		}
-
-		env.TelMap = g.M("begin_time", time.Now().UnixMicro(), "run_mode", "replication") // reset map
-		env.SetTelVal("replication_md5", replication.MD5())
-		err = runTask(cfg, &replication)
-		if err != nil {
-			eG.Capture(err, cfg.StreamName)
-
-			// if a connection issue, stop
-			if e, ok := err.(*g.ErrType); ok && strings.Contains(e.Debug(), "Could not connect to ") {
-				replication.FailErr = g.ErrMsg(e)
+			if cfg.ReplicationStream.Disabled {
+				g.Debug("skipping stream %s since it is disabled", cfg.StreamName)
+				close(completed[cfg.StreamName])
+				continue
 			}
-		} else {
-			successes++
+
+			wg.Add(1)
+			taskCfg := cfg
+
+			go func() {
+				defer wg.Done()
+
+				// Wait for dependencies to complete
+				for _, dep := range taskCfg.DependsOn {
+					if ch, ok := completed[dep]; ok {
+						<-ch
+					}
+				}
+
+				if interrupted {
+					close(completed[taskCfg.StreamName])
+					return
+				}
+
+				// Acquire semaphore slot
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				mu.Lock()
+				// Chunking cleanup
+				cleaned := cleanedForChunkLoad[taskCfg.Target.Object]
+				if !isThreadChild && !cleaned && (taskCfg.IsFullRefreshWithChunking() || taskCfg.IsTruncateWithChunking()) {
+					if cleanErr := taskCfg.ClearTableForChunkLoadWithRange(); cleanErr != nil {
+						eG.Capture(cleanErr, taskCfg.StreamName)
+						mu.Unlock()
+						close(completed[taskCfg.StreamName])
+						return
+					}
+					cleanedForChunkLoad[taskCfg.Target.Object] = true
+				}
+				counter++
+				localCounter := counter
+				mu.Unlock()
+
+				g.Info("[%d / %d] running stream %s", localCounter, streamCnt, env.BlueString(taskCfg.StreamName))
+
+				taskErr := runTask(taskCfg, &replication)
+
+				mu.Lock()
+				if taskErr != nil {
+					eG.Capture(taskErr, taskCfg.StreamName)
+					if e, ok := taskErr.(*g.ErrType); ok && strings.Contains(e.Debug(), "Could not connect to ") {
+						replication.FailErr = g.ErrMsg(e)
+					}
+				} else {
+					successes++
+				}
+				mu.Unlock()
+
+				close(completed[taskCfg.StreamName])
+			}()
+		}
+
+		wg.Wait()
+	} else {
+		// Sequential execution (original behavior)
+		for _, cfg := range replication.Tasks {
+			if interrupted {
+				break
+			}
+
+			cleaned := cleanedForChunkLoad[cfg.Target.Object]
+			if !isThreadChild && !cleaned && (cfg.IsFullRefreshWithChunking() || cfg.IsTruncateWithChunking()) {
+				if err = cfg.ClearTableForChunkLoadWithRange(); err != nil {
+					return g.Error(err, "could not clear table in target conn for chunk loading")
+				}
+				cleanedForChunkLoad[cfg.Target.Object] = true
+			}
+
+			if sling.IsReplicationRunMode() {
+				env.LogSink = nil
+			}
+
+			if cfg.ReplicationStream.Disabled {
+				println()
+				g.Debug("skipping stream %s since it is disabled", cfg.StreamName)
+				continue
+			} else if streamCnt == 1 {
+				g.Info("Sling Replication | %s -> %s | %s", replication.Source, replication.Target, env.BlueString(cfg.StreamName))
+			} else {
+				println()
+				counter++
+				g.Info("[%d / %d] running stream %s", counter, streamCnt, env.BlueString(cfg.StreamName))
+			}
+
+			env.TelMap = g.M("begin_time", time.Now().UnixMicro(), "run_mode", "replication")
+			env.SetTelVal("replication_md5", replication.MD5())
+			err = runTask(cfg, &replication)
+			if err != nil {
+				eG.Capture(err, cfg.StreamName)
+				if e, ok := err.(*g.ErrType); ok && strings.Contains(e.Debug(), "Could not connect to ") {
+					replication.FailErr = g.ErrMsg(e)
+				}
+			} else {
+				successes++
+			}
 		}
 	}
 
