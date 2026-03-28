@@ -49,3 +49,6 @@ test.xlsx
 .env
 AGENTS.md
 CLAUDE.md
+sling-custom
+sling-custom-linux
+.idea/
