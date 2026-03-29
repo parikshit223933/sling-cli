@@ -1205,8 +1205,12 @@ func (cfg *Config) GetFormatMap() (m map[string]any, err error) {
 		m["stream_name"] = strings.ToLower(cfg.StreamName)
 	}
 
-	// pass env values
+	// pass env values (copy map to avoid concurrent map read/write panic)
+	envCopy := make(map[string]string, len(cfg.Env))
 	for k, v := range cfg.Env {
+		envCopy[k] = v
+	}
+	for k, v := range envCopy {
 		if _, found := m[k]; !found && v != "" {
 			m[k] = v
 		}
