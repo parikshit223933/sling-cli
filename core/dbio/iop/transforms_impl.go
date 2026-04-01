@@ -114,6 +114,14 @@ func init() {
 			stages = append(stages, stage)
 		case map[string]string:
 			stages = append(stages, v)
+		case map[string][]string:
+			// From database.setTransforms: {col: [transform1, transform2]}
+			// Convert to [{col: transform1}, {col: transform2}]
+			for col, transforms := range v {
+				for _, t := range transforms {
+					stages = append(stages, map[string]string{col: t})
+				}
+			}
 		case string:
 			// Try JSON
 			if err := json.Unmarshal([]byte(v), &stages); err != nil {
