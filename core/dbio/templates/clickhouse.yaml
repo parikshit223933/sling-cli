@@ -30,11 +30,16 @@ core:
     INSERT INTO {tgt_table} ({insert_fields})
     SELECT {src_fields} FROM {src_table} src
 
+  # Use lightweight DELETE (ClickHouse 23.3+) instead of ALTER TABLE DELETE.
+  # ALTER TABLE DELETE triggers a heavy mutation that rewrites entire parts
+  # and can take 7-16 minutes on large tables (60M+ rows), causing HTTP
+  # timeouts and stuck mutation queues. Lightweight DELETE just marks rows
+  # as deleted and completes in under a second.
   merge_delete_insert: |
-    ALTER TABLE {tgt_table} DELETE
+    DELETE FROM {tgt_table}
     WHERE ({tgt_pk_fields}) IN (
       SELECT {src_pk_fields} FROM {src_table}
-    ) SETTINGS mutations_sync = 1;
+    );
     INSERT INTO {tgt_table} ({insert_fields})
     SELECT {src_fields} FROM {src_table} src
 
@@ -44,10 +49,10 @@ core:
 
   merge_change_capture: |
     SET allow_experimental_window_functions = 1;
-    ALTER TABLE {tgt_table} DELETE
+    DELETE FROM {tgt_table}
     WHERE ({tgt_pk_fields}) IN (
       SELECT {src_pk_fields} FROM {src_table}
-    ) SETTINGS mutations_sync = 1;
+    );
     INSERT INTO {tgt_table} ({insert_fields})
     SELECT {src_fields} FROM (
       SELECT *, row_number() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
@@ -71,11 +76,11 @@ core:
         FROM {src_table}
       ) WHERE _rn = 1 AND _sling_synced_op = 'D'
     ) SETTINGS mutations_sync = 1;
-    ALTER TABLE {tgt_table} DELETE
+    DELETE FROM {tgt_table}
     WHERE ({tgt_pk_fields}) IN (
       SELECT {src_pk_fields} FROM {src_table}
       WHERE _sling_synced_op != 'D'
-    ) SETTINGS mutations_sync = 1;
+    );
     INSERT INTO {tgt_table} ({insert_fields})
     SELECT {src_fields} FROM (
       SELECT *, row_number() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
