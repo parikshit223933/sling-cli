@@ -1079,13 +1079,28 @@ func (conn *BaseConn) StreamRowsContext(ctx context.Context, query string, optio
 func (conn *BaseConn) setTransforms(columns iop.Columns) {
 	colTransforms := map[string][]string{}
 
-	// merge from existing
+	// merge from existing (supports both map[string][]string and []map[string]string formats)
 	if transforms := conn.GetProp("transforms"); transforms != "" {
+		// Try map[string][]string format first (from previous setTransforms calls)
 		colTransformsExisting := map[string][]string{}
-		g.Unmarshal(transforms, &colTransformsExisting)
-		for k, v := range colTransformsExisting {
-			if _, ok := colTransforms[k]; !ok {
-				colTransforms[k] = v
+		if err := g.Unmarshal(transforms, &colTransformsExisting); err == nil {
+			for k, v := range colTransformsExisting {
+				if _, ok := colTransforms[k]; !ok {
+					colTransforms[k] = v
+				}
+			}
+		} else {
+			// Try []map[string]string format (from user-configured transforms)
+			var stageTransforms []map[string]string
+			if err := g.Unmarshal(transforms, &stageTransforms); err == nil {
+				for _, stage := range stageTransforms {
+					for col, transform := range stage {
+						key := strings.ToLower(col)
+						if _, ok := colTransforms[key]; !ok {
+							colTransforms[key] = []string{transform}
+						}
+					}
+				}
 			}
 		}
 	}

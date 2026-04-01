@@ -279,20 +279,17 @@ func (t *TaskExecution) ReadFromDB(cfg *Config, srcConn database.Connection) (df
 		}
 	}
 
+	// Set user-configured transforms (hash_md5, etc.) on the source connection.
+	// These get merged with auto-detected transforms (parse_bit for MySQL BIT)
+	// in setTransforms() and applied to each stream via ds.SetConfig(conn.Props()).
+	if colTransforms := t.Config.TransformsPrepared(); len(colTransforms) > 0 {
+		srcConn.SetProp("transforms", g.Marshal(colTransforms))
+	}
+
 	df, err = srcConn.BulkExportFlow(sTable)
 	if err != nil {
 		err = g.Error(err, "Could not BulkExportFlow")
 		return t.df, err
-	}
-
-	// Apply user-configured transforms (hash_md5, etc.) to the dataflow.
-	// For DB sources, transforms are not passed via options to BulkExportFlow,
-	// so we apply them to each stream's StreamProcessor after export.
-	if colTransforms := t.Config.TransformsPrepared(); len(colTransforms) > 0 {
-		transformsJSON := g.Marshal(colTransforms)
-		for _, ds := range df.Streams {
-			ds.Sp.SetConfig(map[string]string{"transforms": transformsJSON})
-		}
 	}
 
 	err = t.setColumnKeys(df)
