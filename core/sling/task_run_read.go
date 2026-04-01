@@ -285,6 +285,16 @@ func (t *TaskExecution) ReadFromDB(cfg *Config, srcConn database.Connection) (df
 		return t.df, err
 	}
 
+	// Apply user-configured transforms (hash_md5, etc.) to the dataflow.
+	// For DB sources, transforms are not passed via options to BulkExportFlow,
+	// so we apply them to each stream's StreamProcessor after export.
+	if colTransforms := t.Config.TransformsPrepared(); len(colTransforms) > 0 {
+		transformsJSON := g.Marshal(colTransforms)
+		for _, ds := range df.Streams {
+			ds.Sp.SetConfig(map[string]string{"transforms": transformsJSON})
+		}
+	}
+
 	err = t.setColumnKeys(df)
 	if err != nil {
 		err = g.Error(err, "Could not set column keys")
