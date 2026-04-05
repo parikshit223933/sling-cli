@@ -403,6 +403,22 @@ func (conn *ClickhouseConn) BulkImportStream(tableFName string, ds *iop.Datastre
 				return g.Error(err, "columns mismatch")
 			}
 
+			// Skip the batch if no columns resolved to target columns.
+			// Otherwise GenerateInsertStatement builds
+			// `INSERT INTO tbl () FORMAT Native` which ClickHouse rejects
+			// as "Syntax error: failed at position N: ) FORMAT Native".
+			// This can happen on Mongo incremental runs where a batch is
+			// yielded with an empty (or stale) Columns slice — even though
+			// the sample-inferred batch.Columns may have entries, the
+			// intersection with the target table can be empty if the
+			// source cursor returned zero documents and the batch's own
+			// column state is inconsistent. The deferred Rollback() above
+			// will release the transaction that conn.Begin opened.
+			if len(insCols) == 0 {
+				g.Debug("skipping empty-columns batch for %s (batch.Columns=%d, insCols=0)", tableFName, len(batch.Columns))
+				return nil
+			}
+
 			insertStatement := conn.GenerateInsertStatement(
 				table.FullName(),
 				insCols,
