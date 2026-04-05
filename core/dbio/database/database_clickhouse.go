@@ -440,6 +440,7 @@ func (conn *ClickhouseConn) BulkImportStream(tableFName string, ds *iop.Datastre
 				}
 			}
 
+			countBefore := count
 			for row := range batch.Rows {
 				var eG g.ErrorGroup
 
@@ -517,6 +518,18 @@ func (conn *ClickhouseConn) BulkImportStream(tableFName string, ds *iop.Datastre
 					g.Trace("error for row: %#v", row)
 					return g.Error(err, "could not execute statement")
 				}
+			}
+
+			// Skip stmt.Close + Commit on empty batches. Can happen on Mongo
+			// incremental runs where NewBatch gets called (columns resolved
+			// from the stream's type inference) but the cursor yields zero
+			// documents — ClickHouse rejects an empty
+			// `INSERT INTO tbl () FORMAT Native` with
+			// "Syntax error: failed at position N: ) FORMAT Native". The
+			// deferred conn.Rollback() will release the transaction opened
+			// above. Non-empty batches are unaffected.
+			if count == countBefore {
+				return nil
 			}
 
 			err = stmt.Close()
