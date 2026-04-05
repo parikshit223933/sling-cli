@@ -276,6 +276,37 @@ func (conn *MongoDBConn) processObjectIDValue(val any) any {
 	}
 }
 
+// coerceIncrementalFilterValue converts a raw string incremental checkpoint
+// value (as produced by iop.FormatValue + mongodb.yaml's timestamp_layout_str
+// template, e.g. `ISODate("2024-09-10T18:44:38.331000Z")`) into a BSON-ready
+// value with the correct type. MongoDB/DocumentDB compare BSON types strictly,
+// so a string in a `$gt` clause will never match Date-typed fields, causing
+// incremental syncs on Mongo sources to silently match zero rows. This helper:
+//   - strips the ISODate("...") wrapper if present
+//   - returns a time.Time when the inner value is an ISO 8601 datetime
+//   - returns an ObjectID when the value is a 24-char hex string (for _id keys)
+//   - falls back to the raw string otherwise
+// This is only called from the incremental/backfill filter paths in
+// StreamRowsContext; the main user-provided `filter:` option continues to go
+// through processMongoFilter which already handles these conversions.
+func (conn *MongoDBConn) coerceIncrementalFilterValue(s string) any {
+	// strip ISODate("...") wrapper if present
+	if strings.HasPrefix(s, `ISODate("`) && strings.HasSuffix(s, `")`) {
+		s = strings.TrimSuffix(strings.TrimPrefix(s, `ISODate("`), `")`)
+	}
+	// ObjectID (24-char hex) — for update_key: _id on collections ordered by insertion
+	if conn.isObjectIDString(s) {
+		if oid, err := primitive.ObjectIDFromHex(s); err == nil {
+			return oid
+		}
+	}
+	// ISO 8601 datetime — the common case for update_key: updated_at
+	if t, ok := parseISODateString(s); ok {
+		return t
+	}
+	return s
+}
+
 // parseISODateString attempts to parse an ISO 8601 datetime string.
 // Returns the parsed time and true if successful, zero time and false otherwise.
 func parseISODateString(s string) (time.Time, bool) {
@@ -363,15 +394,23 @@ func (conn *MongoDBConn) StreamRowsContext(ctx context.Context, collectionName s
 		}
 	}
 
-	// Add incremental/backfill filters if specified
+	// Add incremental/backfill filters if specified.
+	// The raw string values come from iop.FormatValue via the Mongo template's
+	// timestamp_layout_str ('ISODate("{value}")'), which produces strings that
+	// MongoDB cannot compare against Date fields directly. coerceIncrementalFilterValue
+	// strips the wrapper and returns a properly typed BSON value (time.Time for
+	// datetimes, ObjectID for 24-hex-char strings, raw string otherwise).
 	if updateKey != "" && incrementalValue != "" {
 		// incremental mode
 		incrementalValue = strings.Trim(incrementalValue, "'")
-		filter = append(filter, bson.E{Key: updateKey, Value: bson.D{{Key: "$gt", Value: incrementalValue}}})
+		val := conn.coerceIncrementalFilterValue(incrementalValue)
+		filter = append(filter, bson.E{Key: updateKey, Value: bson.D{{Key: "$gt", Value: val}}})
 	} else if updateKey != "" && startValue != "" && endValue != "" {
 		// backfill mode
-		filter = append(filter, bson.E{Key: updateKey, Value: bson.D{{Key: "$gte", Value: startValue}}})
-		filter = append(filter, bson.E{Key: updateKey, Value: bson.D{{Key: "$lte", Value: endValue}}})
+		startVal := conn.coerceIncrementalFilterValue(strings.Trim(startValue, "'"))
+		endVal := conn.coerceIncrementalFilterValue(strings.Trim(endValue, "'"))
+		filter = append(filter, bson.E{Key: updateKey, Value: bson.D{{Key: "$gte", Value: startVal}}})
+		filter = append(filter, bson.E{Key: updateKey, Value: bson.D{{Key: "$lte", Value: endVal}}})
 	}
 
 	if strings.TrimSpace(collectionName) == "" {
