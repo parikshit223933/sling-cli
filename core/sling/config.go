@@ -1592,6 +1592,16 @@ type SourceOptions struct {
 	ChunkExpr      *string             `json:"chunk_expr,omitempty" yaml:"chunk_expr,omitempty"`
 	Encoding       *iop.Encoding       `json:"encoding,omitempty" yaml:"encoding,omitempty"`
 
+	// IncrementalBuffer widens the incremental lookback window by subtracting
+	// the given duration from the target's max(update_key) before building the
+	// source WHERE clause. Applies only to datetime/date/timestamp update keys;
+	// ignored for numeric keys. Mitigates the snapshot-isolation + replica-lag
+	// race where a row updated during Sling's scan can be permanently skipped
+	// because a neighboring row with higher update_key advances the watermark
+	// past the stuck row's new value. Accepts Go duration strings: "1h", "30m",
+	// "1h30m", "45s". Empty disables the feature (default).
+	IncrementalBuffer string `json:"incremental_buffer,omitempty" yaml:"incremental_buffer,omitempty"`
+
 	// columns & transforms were moved out of source_options
 	// https://github.com/slingdata-io/sling-cli/issues/348
 	Columns    any `json:"columns,omitempty" yaml:"columns,omitempty"`       // legacy
@@ -1902,6 +1912,9 @@ func (o *SourceOptions) SetDefaults(sourceOptions SourceOptions) {
 	}
 	if o.Encoding == nil {
 		o.Encoding = sourceOptions.Encoding
+	}
+	if o.IncrementalBuffer == "" {
+		o.IncrementalBuffer = sourceOptions.IncrementalBuffer
 	}
 	if o.Columns == nil {
 		o.Columns = sourceOptions.Columns // legacy

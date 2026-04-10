@@ -1,0 +1,20 @@
+source: MYSQL_TEST
+target: CH_TEST
+
+# Integer update_key — buffer must be silently ignored for non-time-like keys.
+defaults:
+  mode: incremental
+  source_options:
+    incremental_buffer: 1h
+  target_options:
+    add_new_columns: false
+    column_casing: snake
+
+streams:
+  test_src.events_intkey:
+    object: test_tgt.events_intkey
+    primary_key: [id]
+    update_key: id
+    select:
+      - id
+      - stage

@@ -252,6 +252,38 @@ func getIncrementalValueViaDB(cfg *Config, tgtConn database.Connection, srcConnT
 		maxCol.Type = iop.DateType // force date type
 	}
 
+	// Apply incremental_buffer: widen the lookback window to tolerate the
+	// snapshot-isolation + replica-lag race where a row updated during
+	// Sling's scan can be permanently skipped because a neighboring row
+	// with higher update_key advances the watermark past the stuck row's
+	// new value. Buffer is only meaningful for time-like update keys and
+	// only when the target already has data (cfg.IncrementalVal != nil).
+	if cfg.Source.Options != nil && cfg.Source.Options.IncrementalBuffer != "" && cfg.IncrementalVal != nil {
+		if maxCol.IsDatetime() || maxCol.Type.IsDate() {
+			bufStr := cfg.Source.Options.IncrementalBuffer
+			buf, bufErr := time.ParseDuration(bufStr)
+			switch {
+			case bufErr != nil:
+				g.Warn("incremental_buffer %q is not a valid Go duration: %v (skipping buffer, full precision used)", bufStr, bufErr)
+			case buf < 0:
+				g.Warn("incremental_buffer %q is negative (skipping buffer)", bufStr)
+			case buf == 0:
+				// explicit no-op — do nothing
+			default:
+				t := cast.ToTime(cfg.IncrementalVal)
+				if t.IsZero() {
+					g.Warn("incremental_buffer: could not cast incremental value %v (type %T) to time.Time (skipping buffer)", cfg.IncrementalVal, cfg.IncrementalVal)
+				} else {
+					shifted := t.Add(-buf)
+					g.Debug("incremental_buffer=%s applied: %s -> %s (update_key=%s)", bufStr, t.Format(time.RFC3339Nano), shifted.Format(time.RFC3339Nano), tgtUpdateKey)
+					cfg.IncrementalVal = shifted
+				}
+			}
+		} else {
+			g.Debug("incremental_buffer=%s ignored: update_key %q has non-datetime type %q", cfg.Source.Options.IncrementalBuffer, tgtUpdateKey, maxCol.Type)
+		}
+	}
+
 	cfg.IncrementalValStr = iop.FormatValue(cfg.IncrementalVal, maxCol.Type, srcConnType)
 
 	return

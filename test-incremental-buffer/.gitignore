@@ -1,0 +1,7 @@
+sling-test-bin
+sling-home/env.yaml.local
+sling-home/executions/
+sling-home/*.log
+sling-home/.sling.db*
+replication-zero-buffer.yaml
+replication-bad-buffer.yaml

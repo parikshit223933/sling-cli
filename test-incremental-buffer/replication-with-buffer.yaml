@@ -1,0 +1,22 @@
+source: MYSQL_TEST
+target: CH_TEST
+
+defaults:
+  mode: incremental
+  source_options:
+    incremental_buffer: 1h
+  target_options:
+    add_new_columns: false
+    column_casing: snake
+
+streams:
+  test_src.events:
+    object: test_tgt.events
+    primary_key: [id]
+    update_key: modified_on
+    select:
+      - id
+      - stage
+      - note
+      - modified_on
+      - last_modified
