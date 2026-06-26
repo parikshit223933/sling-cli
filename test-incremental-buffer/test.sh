@@ -435,6 +435,97 @@ YAML
   rm -f "$SCRIPT_DIR/replication-bad-buffer.yaml"
 }
 
+test_12_intkey_gap_without_buffer() {
+  log "TEST 12: integer key — a late lower id is stranded WITHOUT buffer (reproduces id-gap)"
+  reset_data
+  cat > "$SCRIPT_DIR/replication-intkey-nobuf.yaml" <<'YAML'
+source: MYSQL_TEST
+target: CH_TEST
+defaults:
+  mode: incremental
+  target_options:
+    add_new_columns: false
+    column_casing: snake
+streams:
+  test_src.events_intkey:
+    object: test_tgt.events_intkey
+    primary_key: [id]
+    update_key: id
+    select: [id, stage]
+YAML
+  # ids 1,2,3,5 commit first (4's txn is still in flight); CH watermark becomes 5
+  mysql_exec "INSERT INTO events_intkey (id, stage) VALUES (1,'A'),(2,'B'),(3,'C'),(5,'E');" >/dev/null
+  run_sling replication-intkey-nobuf.yaml
+  assert_eq "4" "$(ch_query "SELECT count() FROM test_tgt.events_intkey")" "test_12: initial 4 rows synced"
+  # the late row id=4 commits AFTER the watermark already advanced to 5
+  mysql_exec "INSERT INTO events_intkey (id, stage) VALUES (4,'D');" >/dev/null
+  run_sling replication-intkey-nobuf.yaml
+  # WHERE id > 5 → id=4 is below the watermark → skipped forever
+  assert_eq "4" "$(ch_query "SELECT count() FROM test_tgt.events_intkey")" "test_12: id=4 STRANDED (count stays 4, reproduces id-gap)"
+  assert_eq "0" "$(ch_query "SELECT count() FROM test_tgt.events_intkey WHERE id=4")" "test_12: id=4 missing in CH"
+  rm -f "$SCRIPT_DIR/replication-intkey-nobuf.yaml"
+}
+
+test_13_intkey_buffer_catches_late_id() {
+  log "TEST 13: integer buffer re-reads recent ids and catches the late id (FIX verification)"
+  reset_data
+  cat > "$SCRIPT_DIR/replication-intkey-buf.yaml" <<'YAML'
+source: MYSQL_TEST
+target: CH_TEST
+defaults:
+  mode: incremental
+  source_options:
+    incremental_buffer: "3"
+  target_options:
+    add_new_columns: false
+    column_casing: snake
+streams:
+  test_src.events_intkey:
+    object: test_tgt.events_intkey
+    primary_key: [id]
+    update_key: id
+    select: [id, stage]
+YAML
+  mysql_exec "INSERT INTO events_intkey (id, stage) VALUES (1,'A'),(2,'B'),(3,'C'),(5,'E');" >/dev/null
+  run_sling replication-intkey-buf.yaml
+  assert_eq "4" "$(ch_query "SELECT count() FROM test_tgt.events_intkey")" "test_13: initial 4 rows synced"
+  mysql_exec "INSERT INTO events_intkey (id, stage) VALUES (4,'D');" >/dev/null
+  run_sling replication-intkey-buf.yaml
+  # buffer=3 → WHERE id > (5-3)=2 → re-reads 3,4,5 → id=4 recovered
+  assert_eq "5" "$(ch_query "SELECT count() FROM test_tgt.events_intkey")" "test_13: id=4 RECOVERED (count 5, fix works)"
+  assert_eq "D" "$(ch_query "SELECT stage FROM test_tgt.events_intkey WHERE id=4")" "test_13: id=4 stage correct"
+  rm -f "$SCRIPT_DIR/replication-intkey-buf.yaml"
+}
+
+test_14_intkey_buffer_boundary_outside() {
+  log "TEST 14: integer buffer is a bounded window — an id far below (max - buffer) is correctly missed"
+  reset_data
+  cat > "$SCRIPT_DIR/replication-intkey-buf2.yaml" <<'YAML'
+source: MYSQL_TEST
+target: CH_TEST
+defaults:
+  mode: incremental
+  source_options:
+    incremental_buffer: "2"
+  target_options:
+    add_new_columns: false
+    column_casing: snake
+streams:
+  test_src.events_intkey:
+    object: test_tgt.events_intkey
+    primary_key: [id]
+    update_key: id
+    select: [id, stage]
+YAML
+  mysql_exec "INSERT INTO events_intkey (id, stage) VALUES (1,'A'),(2,'B'),(3,'C'),(10,'J');" >/dev/null
+  run_sling replication-intkey-buf2.yaml   # watermark = 10
+  # late id=4: buffer=2 → WHERE id > (10-2)=8 → 4 is below 8 → correctly missed
+  mysql_exec "INSERT INTO events_intkey (id, stage) VALUES (4,'D');" >/dev/null
+  run_sling replication-intkey-buf2.yaml
+  assert_eq "0" "$(ch_query "SELECT count() FROM test_tgt.events_intkey WHERE id=4")" "test_14: id far below buffer window correctly missed (confirms bounded-window semantics)"
+  rm -f "$SCRIPT_DIR/replication-intkey-buf2.yaml"
+}
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
@@ -457,6 +548,9 @@ main() {
     test_09_intkey_buffer_ignored
     test_10_zero_buffer_equals_no_buffer
     test_11_invalid_buffer_string
+    test_12_intkey_gap_without_buffer
+    test_13_intkey_buffer_catches_late_id
+    test_14_intkey_buffer_boundary_outside
   )
 
   for t in "${tests[@]}"; do

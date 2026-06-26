@@ -256,7 +256,8 @@ func getIncrementalValueViaDB(cfg *Config, tgtConn database.Connection, srcConnT
 	// snapshot-isolation + replica-lag race where a row updated during
 	// Sling's scan can be permanently skipped because a neighboring row
 	// with higher update_key advances the watermark past the stuck row's
-	// new value. Buffer is only meaningful for time-like update keys and
+	// new value. Buffer applies to datetime keys (subtract a duration, e.g.
+	// "1h") and to integer keys (subtract an id/row count, e.g. "10000"), and
 	// only when the target already has data (cfg.IncrementalVal != nil).
 	if cfg.Source.Options != nil && cfg.Source.Options.IncrementalBuffer != "" && cfg.IncrementalVal != nil {
 		if maxCol.IsDatetime() || maxCol.Type.IsDate() {
@@ -279,8 +280,35 @@ func getIncrementalValueViaDB(cfg *Config, tgtConn database.Connection, srcConnT
 					cfg.IncrementalVal = shifted
 				}
 			}
+		} else if maxCol.Type.IsInteger() {
+			// Integer (e.g. primary-key `id`) update keys have an analogous
+			// out-of-order-commit race: a row whose transaction commits *after*
+			// a higher id has already advanced the watermark is stranded
+			// (the next scan filters `id > watermark` and never sees it).
+			// Interpret incremental_buffer as a row/id count and subtract it
+			// from the integer watermark so the next scan re-reads that safety
+			// margin. The DELETE+INSERT merge is idempotent, so re-reading is a
+			// no-op for the unchanged rows already in the target.
+			bufStr := strings.TrimSpace(cfg.Source.Options.IncrementalBuffer)
+			buf, bufErr := cast.ToInt64E(bufStr)
+			switch {
+			case bufErr != nil:
+				g.Warn("incremental_buffer %q is not a valid integer for integer update_key %q (skipping buffer, full precision used)", bufStr, tgtUpdateKey)
+			case buf < 0:
+				g.Warn("incremental_buffer %q is negative (skipping buffer)", bufStr)
+			case buf == 0:
+				// explicit no-op — do nothing
+			default:
+				cur := cast.ToInt64(cfg.IncrementalVal)
+				shifted := cur - buf
+				if shifted < 0 {
+					shifted = 0
+				}
+				g.Debug("incremental_buffer=%s applied (integer): %d -> %d (update_key=%s)", bufStr, cur, shifted, tgtUpdateKey)
+				cfg.IncrementalVal = shifted
+			}
 		} else {
-			g.Debug("incremental_buffer=%s ignored: update_key %q has non-datetime type %q", cfg.Source.Options.IncrementalBuffer, tgtUpdateKey, maxCol.Type)
+			g.Debug("incremental_buffer=%s ignored: update_key %q has unsupported type %q", cfg.Source.Options.IncrementalBuffer, tgtUpdateKey, maxCol.Type)
 		}
 	}
 
