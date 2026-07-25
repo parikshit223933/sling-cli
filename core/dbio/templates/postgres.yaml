@@ -60,10 +60,21 @@ core:
     FROM {src_table} src
     WHERE {src_tgt_pk_equal}
 
+  # The src_table CTEs dedup the staged batch on the primary key before
+  # merging: a long incremental read racing source churn can emit the same
+  # row twice (row modified mid-scan re-appears later in the update-key
+  # index scan), and two copies of a NEW pk both miss the {temp_table}
+  # update-set and collide on the target's unique index. The temp table is
+  # loaded by a single sequential COPY, so ctid order == arrival order and
+  # "order by ctid desc" keeps the LAST-received copy — the freshest
+  # version of the row. Streams without a primary key never reach these
+  # merge strategies (they append/full-refresh), so {pk_fields} is always
+  # non-empty here.
   merge_update_insert: |
     create temporary table {temp_table} as
     with src_table as (
-      select {src_fields} from {src_table}
+      select distinct on ({pk_fields}) {src_fields} from {src_table}
+      order by {pk_fields}, ctid desc
     )
     , updates as (
       update {tgt_table} tgt
@@ -77,7 +88,8 @@ core:
     {temp_table_index_sql};
 
     with src_table as (
-      select {src_fields} from {src_table}
+      select distinct on ({pk_fields}) {src_fields} from {src_table}
+      order by {pk_fields}, ctid desc
     )
     insert into {tgt_table}
     ({insert_fields})
@@ -95,7 +107,10 @@ core:
       WHERE {src_tgt_pk_equal}
     );
     INSERT INTO {tgt_table} ({insert_fields})
-    SELECT {src_fields} FROM {src_table} src
+    SELECT {src_fields} FROM (
+      SELECT DISTINCT ON ({pk_fields}) * FROM {src_table}
+      ORDER BY {pk_fields}, ctid DESC
+    ) src
 
   merge_change_capture: |
     DELETE FROM {tgt_table} tgt
