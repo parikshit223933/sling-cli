@@ -897,7 +897,10 @@ func prepareFinal(
 
 	// Handle Full Refresh Mode: Drop the target table if it exists
 	// Don't drop if full refreshing with range, will already have been dropped
-	if cfg.Mode == FullRefreshMode && !t.Config.IsFullRefreshWithChunking() {
+	// Don't drop if the new data will be swapped into place -- the whole point of
+	// swapping is that readers keep seeing the old table until the swap publishes
+	// the new one, and dropping here would reopen the very gap it closes.
+	if cfg.Mode == FullRefreshMode && !t.Config.IsFullRefreshWithChunking() && !fullRefreshSwapsIntoPlace(cfg, tgtConn) {
 		if err := tgtConn.DropTable(targetTable.FullName()); err != nil {
 			return g.Error(err, "could not drop table "+targetTable.FullName())
 		}
@@ -969,9 +972,34 @@ func prepareFinal(
 	return nil
 }
 
+// fullRefreshSwapsIntoPlace reports whether a full-refresh publishes its new data by
+// swapping the temp table into place rather than dropping the target and refilling it.
+//
+// Dropping and refilling leaves the target missing, then empty, for the duration of the
+// insert. Anything querying it in that window fails outright (UNKNOWN_TABLE) or silently
+// reads zero rows. Swapping avoids that entirely: the target keeps serving the previous
+// snapshot until the swap makes the new one visible in one step.
+//
+// prepareFinal and mergeData must agree on this, hence the shared helper -- if only one
+// of them changes behaviour the target gets dropped and never repopulated.
+//
+// Chunked full-refresh is excluded: it drops the target up-front on purpose and then
+// appends chunk by chunk, so there is no single temp table to swap in.
+func fullRefreshSwapsIntoPlace(cfg *Config, tgtConn database.Connection) bool {
+	if cfg.Mode != FullRefreshMode || cfg.IsFullRefreshWithChunking() {
+		return false
+	}
+	return g.In(tgtConn.GetType(), dbio.TypeDbClickhouse)
+}
+
 func mergeData(cfg *Config, tgtConn database.Connection, tableTmp, targetTable database.Table) error {
 	if cfg.Mode == FullRefreshMode && g.In(tgtConn.GetType(), dbio.TypeDbIceberg) {
 		// Use swap, we cannot yet insert from one table to another
+		return transferBySwappingTables(tgtConn, tableTmp, targetTable)
+	}
+
+	if fullRefreshSwapsIntoPlace(cfg, tgtConn) {
+		// Swap so readers never observe a missing or empty target table
 		return transferBySwappingTables(tgtConn, tableTmp, targetTable)
 	}
 
