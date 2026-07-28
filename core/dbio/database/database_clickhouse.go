@@ -633,6 +633,38 @@ retry:
 	return rowAffCnt, err
 }
 
+// SwapTable swaps two tables atomically using ClickHouse's EXCHANGE TABLES.
+//
+// The generic BaseConn.SwapTable does a three-step rename (tgt->temp, src->tgt,
+// temp->src). Between the first and second rename the target name resolves to
+// nothing, so concurrent readers get "Unknown table expression identifier".
+// EXCHANGE TABLES swaps both names in a single atomic metadata operation, so a
+// reader sees either the old table or the new one and never a gap.
+//
+// EXCHANGE is only supported on the Atomic and Replicated database engines. On
+// the legacy Ordinary engine it errors, so fall back to the generic rename in
+// that case rather than failing the sync.
+func (conn *ClickhouseConn) SwapTable(srcTable string, tgtTable string) (err error) {
+	src, err := ParseTableName(srcTable, conn.GetType())
+	if err != nil {
+		return g.Error(err, "could not parse table name %s", srcTable)
+	}
+
+	tgt, err := ParseTableName(tgtTable, conn.GetType())
+	if err != nil {
+		return g.Error(err, "could not parse table name %s", tgtTable)
+	}
+
+	sql := g.F("EXCHANGE TABLES %s AND %s", src.FullName(), tgt.FullName())
+	if _, err = conn.Exec(sql); err == nil {
+		return nil
+	}
+
+	g.Warn("EXCHANGE TABLES failed for %s <-> %s (%s). Falling back to rename-based swap, which is not atomic.", src.FullName(), tgt.FullName(), err.Error())
+
+	return conn.BaseConn.SwapTable(srcTable, tgtTable)
+}
+
 // GenerateMergeSQL generates the upsert SQL using the database default strategy (delete_insert).
 func (conn *ClickhouseConn) GenerateMergeSQL(srcTable string, tgtTable string, pkFields []string) (sql string, err error) {
 	return conn.GenerateMergeSQLWithStrategy(srcTable, tgtTable, pkFields, nil)
