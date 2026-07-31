@@ -63,6 +63,7 @@ type Datastream struct {
 	df            *Dataflow
 	bwRows        chan []any // for correct byte written
 	readyChn      chan struct{}
+	readyOnce     sync.Once // guards the one-time close of readyChn
 	schemaChgChan chan schemaChg
 	bwCsv         *csv.Writer // for correct byte written
 	ID            string
@@ -285,11 +286,20 @@ func (ds *Datastream) DrainReprocess() []any {
 }
 
 // SetReady sets the ds.ready
+//
+// Readiness is a BROADCAST: readyChn is closed, never written to. It used to
+// be signalled by sending a single token into a buffered(1) channel, which
+// Close() then drained during cleanup — so any waiter arriving after the close
+// (in production, Dataflow.PushStreamChan) blocked forever on a token that was
+// already consumed and could never be re-sent. Closing the channel means every
+// waiter, at any time, observes readiness. sync.Once also removes the racy
+// check-then-act on ds.Ready, which could otherwise send twice and leak a
+// goroutine blocked on the full buffer.
 func (ds *Datastream) SetReady() {
-	if !ds.Ready {
+	ds.readyOnce.Do(func() {
 		ds.Ready = true
-		go func() { ds.readyChn <- struct{}{} }()
-	}
+		close(ds.readyChn)
+	})
 }
 
 // SetEmpty sets the ds.Rows channel as empty
@@ -431,7 +441,6 @@ func (ds *Datastream) Close() {
 			select {
 			case <-ds.pauseChan:
 				<-ds.unpauseChan // wait for unpause
-			case <-ds.readyChn:
 			case <-ds.schemaChgChan:
 			default:
 				break loop
@@ -454,10 +463,13 @@ func (ds *Datastream) Close() {
 	ds.closed = true
 	ds.Context.Unlock()
 
-	select {
-	case <-ds.readyChn:
-	default:
-	}
+	// A closed stream is terminal, so release anyone still waiting on
+	// readiness — a source that errored or yielded nothing may never have
+	// signalled, and PushStreamChan would otherwise wait on it forever.
+	// No-op when SetReady() already ran, and the two former readyChn drains
+	// here are gone: readiness is now a close, and draining a closed channel
+	// would spin the cleanup loop above indefinitely.
+	ds.SetReady()
 }
 
 // SetColumns sets the columns

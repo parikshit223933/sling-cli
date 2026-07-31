@@ -28,6 +28,7 @@ type Dataflow struct {
 	OnColumnChanged func(col Column) error
 	OnColumnAdded   func(col Column) error
 	readyChn        chan struct{}
+	readyOnce       sync.Once // guards the one-time close of readyChn
 	StreamMap       map[string]*Datastream
 	closed          bool
 	mux             sync.Mutex
@@ -229,8 +230,15 @@ func (df *Dataflow) Unpause(exceptDs ...string) {
 }
 
 // SetReady sets the df.ready
+//
+// Same broadcast semantics as Datastream.SetReady: readyChn is closed rather
+// than written to. PushStreamChan calls this from four separate places, and
+// the old unbuffered send had exactly one receiver (WaitReady), so every
+// surplus call leaked a goroutine parked on the send forever. sync.Once also
+// closes the check-then-act race on df.Ready, where two callers could both
+// pass the guard before either took the mutex.
 func (df *Dataflow) SetReady() {
-	if !df.Ready {
+	df.readyOnce.Do(func() {
 		df.mux.Lock()
 		defer df.mux.Unlock()
 
@@ -243,8 +251,8 @@ func (df *Dataflow) SetReady() {
 		}
 
 		df.Ready = true
-		go func() { df.readyChn <- struct{}{} }()
-	}
+		close(df.readyChn)
+	})
 }
 
 // SetEmpty sets all underlying datastreams empty
