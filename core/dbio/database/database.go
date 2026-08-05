@@ -1093,12 +1093,26 @@ func (conn *BaseConn) setTransforms(columns iop.Columns) {
 			// Try []map[string]string format (from user-configured transforms)
 			var stageTransforms []map[string]string
 			if err := g.Unmarshal(transforms, &stageTransforms); err == nil {
+				// Accumulate every stage listed for a column, in order, rather than
+				// keeping only the first. A column may legitimately name several
+				// transforms that compose:
+				//
+				//	transforms:
+				//	  - email: hash_md5
+				//	  - email: hmac_sha256
+				//
+				// which must apply md5 and then key the result. Keeping only the
+				// first silently dropped the rest, so the config looked applied but
+				// wasn't — no warning, no error, just unkeyed output.
+				//
+				// This stays idempotent across repeated setTransforms calls because
+				// colTransforms is rebuilt from scratch each call and the value
+				// written back below is this same []map[string]string stage list:
+				// re-parsing it reproduces the identical list rather than doubling it.
 				for _, stage := range stageTransforms {
 					for col, transform := range stage {
 						key := strings.ToLower(col)
-						if _, ok := colTransforms[key]; !ok {
-							colTransforms[key] = []string{transform}
-						}
+						colTransforms[key] = append(colTransforms[key], transform)
 					}
 				}
 			}

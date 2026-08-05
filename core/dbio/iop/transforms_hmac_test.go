@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/flarco/g"
+	"github.com/spf13/cast"
 )
 
 // resetHmacSecret clears the memoised key so a test can choose its own.
@@ -170,6 +171,69 @@ func TestHmacSha256_PreservesEqualityGraph(t *testing.T) {
 				t.Errorf("equality graph broken for %q vs %q: md5Equal=%v keyedEqual=%v",
 					inputs[i], inputs[j], md5Equal, keyedEqual)
 			}
+		}
+	}
+}
+
+// Chaining must survive the real config path: a stage list naming the same
+// column twice has to apply BOTH stages, in order, through Transform.Evaluate.
+// Testing the transform funcs directly misses this — the stage list is built by
+// ParseStageTransforms/NewTransform, and a bug there silently drops stages.
+func TestChainedStagesAppliedInOrder(t *testing.T) {
+	withKey(t, "test-secret-key")
+
+	stages, err := ParseStageTransforms([]any{
+		map[string]any{"email": "hash_md5"},
+		map[string]any{"email": "hmac_sha256"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stages) != 2 {
+		t.Fatalf("ParseStageTransforms dropped stages: got %d, want 2 (%v)", len(stages), stages)
+	}
+
+	sp := NewStreamProcessor()
+	sp.ds = NewDatastream(NewColumns(Column{Name: "email", Type: StringType}))
+
+	tf := NewTransform(stages, sp)
+	if tf == nil {
+		t.Fatal("NewTransform returned nil")
+	}
+
+	row, err := tf.Evaluate([]any{"someone@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := expected("test-secret-key", g.MD5("someone@example.com"))
+	if got := cast.ToString(row[0]); got != want {
+		t.Errorf("chained Evaluate = %q, want HMAC(K, md5(v)) = %q", got, want)
+	}
+}
+
+// The same shape sling builds internally for database sources: transforms
+// arrive as map[string][]string. Per-column order must be preserved, or the
+// hmac stage could be applied before the md5 it is meant to wrap.
+func TestParseStageTransformsPreservesPerColumnOrder(t *testing.T) {
+	stages, err := ParseStageTransforms(map[string][]string{
+		"email": {"trim_space", "lower", "hash_md5", "hmac_sha256"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got []string
+	for _, s := range stages {
+		got = append(got, s["email"])
+	}
+	want := []string{"trim_space", "lower", "hash_md5", "hmac_sha256"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d stages %v, want %d %v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("stage order = %v, want %v", got, want)
 		}
 	}
 }
