@@ -53,10 +53,14 @@ type keyedMac struct {
 // streams concurrently and hash.Hash is not reentrant.
 var hmacPool = sync.Pool{}
 
-// hmacHex32 returns the first 32 hex chars of HMAC-SHA256(key, val).
-// Takes []byte to avoid the allocation a string->[]byte conversion would make
-// on every single value.
-func hmacHex32(key []byte, val []byte) string {
+// hmacHexInto writes the first 32 hex chars of HMAC-SHA256(key, val) into dst.
+//
+// dst and val are allowed to be THE SAME 32 bytes, which is the hot path: the
+// digest is fully computed into a stack array before any byte of dst is
+// written, so overwriting the input in place is safe. Writing straight into the
+// destination avoids one 32-byte allocation and one copy per rewritten key,
+// which at warehouse scale is millions of allocations saved per sync.
+func hmacHexInto(dst []byte, key []byte, val []byte) {
 	var km *keyedMac
 	if v := hmacPool.Get(); v != nil {
 		km = v.(*keyedMac)
@@ -72,10 +76,16 @@ func hmacHex32(key []byte, val []byte) string {
 	km.mac.Write(val)
 	var sum [sha256.Size]byte
 	digest := km.mac.Sum(sum[:0])
-
-	var out [hmacHexLen]byte
-	hex.Encode(out[:], digest[:hmacHexLen/2])
 	hmacPool.Put(km)
+
+	hex.Encode(dst, digest[:hmacHexLen/2])
+}
+
+// hmacHex32 is the allocating form, used by the column-level hmac_sha256
+// transform which has to return a fresh string anyway.
+func hmacHex32(key []byte, val []byte) string {
+	var out [hmacHexLen]byte
+	hmacHexInto(out[:], key, val)
 	return string(out[:])
 }
 
@@ -125,12 +135,19 @@ func hmacJSONKeys(s string, keys map[string]struct{}, key []byte) string {
 	i := 0
 
 	for i < n {
+		// A plain byte loop, deliberately. strings.IndexByte is vectorized but
+		// JSON payloads are dense in quotes — ~30 strings in a typical webhook
+		// body — so the per-call overhead outweighed the vectorization and
+		// measured consistently slower than this.
 		if src[i] != '"' {
 			i++
 			continue
 		}
 
-		// scan the string starting at i
+		// Scan to the end of this string. Keys and values are short, so a plain
+		// byte loop beats IndexByte here — the call overhead dominates. A
+		// backslash in JSON always escapes exactly one character, so skipping
+		// two is both correct and cheaper than counting escape runs.
 		ks := i + 1
 		j := ks
 		for j < n {
@@ -193,8 +210,9 @@ func hmacJSONKeys(s string, keys map[string]struct{}, key []byte) string {
 			b = []byte(src)
 		}
 		// b mirrors src and rewritten ranges never overlap, so b[vs:ve] still
-		// holds the original md5 here. hmacHex32 fully computes before we copy.
-		copy(b[vs:ve], hmacHex32(key, b[vs:ve]))
+		// holds the original md5 here. Writing hex straight back into the same
+		// 32 bytes is safe: the digest is complete before dst is touched.
+		hmacHexInto(b[vs:ve], key, b[vs:ve])
 		i = ve + 1
 	}
 
