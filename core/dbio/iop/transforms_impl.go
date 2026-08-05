@@ -159,6 +159,28 @@ func init() {
 			for colName, transformName := range stage {
 				transformName = strings.TrimSpace(transformName)
 
+				// Parameterised form first: name(arg,arg,...). These are built
+				// per-column because their behaviour depends on the arguments,
+				// so they cannot live in the shared name->transform map.
+				if base, args := parseTransformArgs(transformName); len(args) > 0 {
+					build, ok := TransformsParameterized[base]
+					if !ok {
+						g.Warn("unknown parameterized transform '%s' for column '%s', skipping", base, colName)
+						continue
+					}
+					built, err := build(args)
+					if err != nil {
+						g.Warn("could not build transform '%s' for column '%s': %s", transformName, colName, err.Error())
+						continue
+					}
+					st.stages = append(st.stages, transformStage{
+						colName:   colName,
+						colIndex:  -1,
+						transform: built,
+					})
+					continue
+				}
+
 				// Look up the legacy transform by name
 				if legacyTransform, ok := TransformsLegacyMap[transformName]; ok {
 					st.stages = append(st.stages, transformStage{
