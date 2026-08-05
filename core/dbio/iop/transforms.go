@@ -2,12 +2,10 @@ package iop
 
 import (
 	"bufio"
-	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/sha512"
 	"embed"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"regexp"
@@ -377,9 +375,11 @@ var (
 			if err != nil {
 				return "", err
 			}
-			mac := hmac.New(sha256.New, key)
-			mac.Write([]byte(val))
-			return hex.EncodeToString(mac.Sum(nil))[:hmacHexLen], nil
+			// Shares the pooled, key-primed HMAC used by hmac_sha256_json.
+			// Output is byte-for-byte what hex.EncodeToString(mac.Sum(nil))[:32]
+			// produced before — both are the hex of the first 16 digest bytes —
+			// so already-synced tables stay joinable. See TestHmacPooledMatchesNaive.
+			return hmacHex32(key, []byte(val)), nil
 		},
 	}
 
