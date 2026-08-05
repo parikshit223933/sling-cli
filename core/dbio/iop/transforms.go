@@ -2,13 +2,17 @@ package iop
 
 import (
 	"bufio"
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/sha512"
 	"embed"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -22,6 +26,42 @@ import (
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/transform"
 )
+
+// HmacSecretEnvVar names the environment variable holding the secret key for
+// the hmac_sha256 transform.
+const HmacSecretEnvVar = "SLING_PII_HMAC_KEY"
+
+// hmacHexLen is how many hex characters of the HMAC are kept (128 bits),
+// matching the width of the md5 output this transform is chained onto.
+const hmacHexLen = 32
+
+var (
+	hmacSecretOnce sync.Once
+	hmacSecretVal  []byte
+)
+
+// hmacSecret returns the key for the hmac_sha256 transform, read from the
+// environment on first use.
+//
+// The lookup is deliberately lazy rather than done at init(): a binary that
+// merely *ships* this transform must run normally when no config references
+// it. That is what makes rolling out the new binary a no-op — it is deployed
+// and soaked first, and only later do configs start naming hmac_sha256.
+//
+// When the transform IS used and the key is absent, this returns an error
+// rather than any fallback value. The caller propagates it through
+// Transform.Evaluate into ds.Context.CaptureErr, which fails the stream. A
+// misconfigured run must die loudly; silently emitting unkeyed hashes would
+// repopulate the warehouse with reversible values and look like success.
+func hmacSecret() ([]byte, error) {
+	hmacSecretOnce.Do(func() {
+		hmacSecretVal = []byte(os.Getenv(HmacSecretEnvVar))
+	})
+	if len(hmacSecretVal) == 0 {
+		return nil, g.Error("%s is not set: the hmac_sha256 transform requires a secret key", HmacSecretEnvVar)
+	}
+	return hmacSecretVal, nil
+}
 
 var (
 	TransformsLegacyMap = map[string]TransformLegacy{}
@@ -70,6 +110,7 @@ func init() {
 		TransformHashMd5,
 		TransformHashSha256,
 		TransformHashSha512,
+		TransformHmacSha256,
 		TransformParseBit,
 		TransformBinaryToDecimal,
 		TransformBinaryToHex,
@@ -303,6 +344,42 @@ var (
 		Name: "hash_md5",
 		FuncString: func(sp *StreamProcessor, val string) (string, error) {
 			return g.MD5(val), nil
+		},
+	}
+
+	// TransformHmacSha256 keys a hash so it cannot be reversed by anyone who
+	// does not hold the secret. Unkeyed hashes (hash_md5 above) are computed
+	// with a public function, so an adversary holding a candidate list — or,
+	// for a bounded space like 10-digit phone numbers, simply enumerating it —
+	// recovers the input. HMAC is a PRF: seeing any number of (input, output)
+	// pairs does not let you produce the output for an input you were not given.
+	//
+	// Output is the HMAC truncated to 128 bits, hex-encoded — 32 characters,
+	// the same width as the md5 it replaces, so no target schema changes. A
+	// truncated PRF is still a PRF, and at warehouse scale (~10^8 distinct
+	// values) the collision probability is ~2^-75.
+	//
+	// Intended to be *chained onto* an existing hash rather than replacing it:
+	//
+	//	transforms:
+	//	  - email: hash_md5
+	//	  - email: hmac_sha256
+	//
+	// Stages are applied in order to the same column, so this computes
+	// HMAC(K, md5(v)). Because md5 is public and deterministic, that composition
+	// is still a PRF in v, while preserving the equality graph of the md5 it
+	// wraps exactly: values that hashed equal before still hash equal after.
+	// Every existing join keeps working, and no normalisation decision changes.
+	TransformHmacSha256 = TransformLegacy{
+		Name: "hmac_sha256",
+		FuncString: func(sp *StreamProcessor, val string) (string, error) {
+			key, err := hmacSecret()
+			if err != nil {
+				return "", err
+			}
+			mac := hmac.New(sha256.New, key)
+			mac.Write([]byte(val))
+			return hex.EncodeToString(mac.Sum(nil))[:hmacHexLen], nil
 		},
 	}
 
