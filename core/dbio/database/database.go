@@ -1327,11 +1327,63 @@ func (conn *BaseConn) ExecContext(ctx context.Context, q string, args ...interfa
 }
 
 // ExecMultiContext runs multiple sql queries with context, returns `error`
+// abandonMultiStatementOnError reports whether a multi-statement batch must drop
+// the statements that follow the first failure, instead of collecting the error
+// and carrying on.
+//
+// Carrying on is only safe when the engine guarantees the rest of the batch
+// cannot take effect anyway. On Postgres it cannot: the first error aborts the
+// transaction, every later statement fails with "current transaction is aborted",
+// and the whole thing rolls back. ClickHouse gives no such guarantee - it has no
+// transactional DML, so BeginTxx succeeds but an INSERT that runs after a failed
+// statement is committed the moment it lands and there is nothing to roll back.
+//
+// That silently corrupted the delete_insert merge, which is two statements:
+//
+//	DELETE FROM <tgt> WHERE (pk) IN (SELECT pk FROM <tmp>);
+//	INSERT INTO <tgt> (...) SELECT ... FROM <tmp>;
+//
+// When the DELETE failed, the INSERT still ran and re-added the whole batch on
+// top of the rows the DELETE was meant to remove. Confirmed in production on
+// lsq.prospectactivity_base: system.query_log for 2026-08-07 records the Delete
+// as ExceptionBeforeStart with code 341 at 11:05:08 - its background mutation
+// had died with MEMORY_LIMIT_EXCEEDED - and the Insert as QueryStart plus
+// QueryFinish, code 0, in that same second.
+//
+// Each such duplicate is permanent. incremental_buffer shifts the next run's
+// window forward, so the oldest slice of the failed batch is never revisited:
+// ~15,500 duplicate rows accumulated over 11 incidents in 8 weeks across the two
+// 80M-row activity tables, invisible because count() still looked plausible and
+// only count() - uniqExact(pk) revealed them.
+//
+// SAFETY: no run that passes today can start failing because of this.
+// ExecMultiContext returns eG.Err(), which is already non-nil whenever ANY
+// statement failed - so a batch containing a failing statement ALREADY fails the
+// stream, before and after this change. The success/failure verdict of every run
+// is therefore identical; the only difference is that statements queued behind an
+// error no longer execute, i.e. strictly less work on a path that was already
+// doomed. On the happy path nothing changes at all: every statement runs and
+// rowsAffected accumulates exactly as before.
+//
+// Blast radius is also bounded by dialect: every non-ClickHouse target keeps the
+// original collect-and-continue behaviour byte for byte.
+//
+// The operator-visible outcome is unchanged too - the ErrorGroup already surfaced
+// the error and the run was already reported as FAILED. This only stops the target
+// being corrupted on the way out, which is what makes the retry on the next
+// 5-minute run idempotent: the assumption delete_insert is built on.
+func abandonMultiStatementOnError(t dbio.Type) bool {
+	return t == dbio.TypeDbClickhouse
+}
+
 func (conn *BaseConn) ExecMultiContext(ctx context.Context, qs ...string) (result sql.Result, err error) {
 
 	Res := Result{rowsAffected: 0}
 
 	eG := g.ErrorGroup{}
+	failFast := abandonMultiStatementOnError(conn.GetType())
+
+statements:
 	for _, q := range qs {
 		hasNoDebugKey := strings.HasSuffix(strings.TrimSpace(q), env.NoDebugKey)
 		for _, sql := range ParseSQLMultiStatements(q, conn.GetType()) {
@@ -1341,6 +1393,9 @@ func (conn *BaseConn) ExecMultiContext(ctx context.Context, qs ...string) (resul
 			res, err := conn.Self().ExecContext(ctx, sql)
 			if err != nil {
 				eG.Capture(g.Error(err, "Error executing query"))
+				if failFast {
+					break statements
+				}
 			} else {
 				ra, _ := res.RowsAffected()
 				g.Trace("RowsAffected: %d", ra)

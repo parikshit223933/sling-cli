@@ -149,10 +149,20 @@ func (t *BaseTransaction) ExecMultiContext(ctx context.Context, q string, args .
 	Res := Result{rowsAffected: 0}
 
 	eG := g.ErrorGroup{}
+	// See abandonMultiStatementOnError in database.go. This is the path the
+	// merge actually takes in production: MergeWithStrategy calls
+	// tx.ExecMultiContext whenever a transaction is open, and ClickhouseConn.Merge
+	// always opens one - so fixing only BaseConn.ExecMultiContext would leave the
+	// delete_insert corruption in place.
+	failFast := abandonMultiStatementOnError(t.Conn.GetType())
+
 	for _, sql := range ParseSQLMultiStatements(q, t.Conn.GetType()) {
 		res, err := t.ExecContext(ctx, sql, args...)
 		if err != nil {
 			eG.Capture(g.Error(err, "Error executing query"))
+			if failFast {
+				break
+			}
 		} else {
 			ra, _ := res.RowsAffected()
 			g.Trace("RowsAffected: %d", ra)
