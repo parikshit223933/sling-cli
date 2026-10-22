@@ -1026,6 +1026,14 @@ skipBuffer:
 				break // don't push any rows
 			}
 
+			// Transforms rewrite ds.it.Row in place, so they must run once per
+			// row. schemaChgLoop is re-entered for the SAME row after a pause or
+			// a schema change, and evaluating again there re-applied
+			// non-idempotent transforms on every re-entry: hash_md5 + hmac_sha256
+			// became hmac(md5(hmac(md5(v)))) or deeper.
+			// See datastream_transform_once_test.go.
+			transformed := false
+
 		schemaChgLoop:
 			for {
 				// reprocess row if needed (to expand it as needed)
@@ -1034,11 +1042,12 @@ skipBuffer:
 					row = ds.it.Row
 				} else {
 					// evaluate transforms
-					if transforms := ds.Sp.Config.Transforms; transforms != nil {
+					if transforms := ds.Sp.Config.Transforms; transforms != nil && !transformed {
 						ds.it.Row, err = ds.Sp.Config.Transforms.Evaluate(ds.it.Row)
 						if ds.Context.CaptureErr(err) {
 							break loop
 						}
+						transformed = true
 					}
 					row = ds.Sp.CastRow(ds.it.Row, ds.Columns)
 				}
