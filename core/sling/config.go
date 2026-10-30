@@ -1592,14 +1592,16 @@ type SourceOptions struct {
 	ChunkExpr      *string             `json:"chunk_expr,omitempty" yaml:"chunk_expr,omitempty"`
 	Encoding       *iop.Encoding       `json:"encoding,omitempty" yaml:"encoding,omitempty"`
 
-	// IncrementalBuffer widens the incremental lookback window by subtracting
-	// the given duration from the target's max(update_key) before building the
-	// source WHERE clause. Applies only to datetime/date/timestamp update keys;
-	// ignored for numeric keys. Mitigates the snapshot-isolation + replica-lag
-	// race where a row updated during Sling's scan can be permanently skipped
-	// because a neighboring row with higher update_key advances the watermark
-	// past the stuck row's new value. Accepts Go duration strings: "1h", "30m",
-	// "1h30m", "45s". Empty disables the feature (default).
+	// IncrementalBuffer widens the incremental lookback window by rewinding
+	// the target's max(update_key) before building the source WHERE clause.
+	// Datetime/date/timestamp keys and Mongo ObjectId `_id` keys take a Go
+	// duration ("1h", "30m", "1h30m", "45s"; for ObjectIds it rewinds the
+	// embedded creation time). Integer keys take an id/row count ("10000").
+	// Other key types ignore it. Mitigates the snapshot-isolation +
+	// replica-lag race where a row updated during Sling's scan can be
+	// permanently skipped because a neighboring row with higher update_key
+	// advances the watermark past the stuck row's new value. Empty disables
+	// the feature (default). See incremental_buffer.go.
 	IncrementalBuffer string `json:"incremental_buffer,omitempty" yaml:"incremental_buffer,omitempty"`
 
 	// columns & transforms were moved out of source_options
